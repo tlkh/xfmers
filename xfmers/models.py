@@ -3,7 +3,8 @@ from . import ops
 from . import layers
 
 
-def DecoderTransformer(vocab_size, dec_layers, ff_units, d_model, num_heads, dropout, max_seq_len=512, weight_sharing=False, name="DecoderTransformer"):
+def DecoderTransformer(vocab_size, dec_layers, ff_units, d_model, num_heads, dropout, max_seq_len=512,
+                       weight_sharing=False, efficient_attention=False, shared_qk=False, name="DecoderTransformer"):
     inputs = tf.keras.Input(shape=(None, ), name="inputs")
     padding_mask = layers.PaddingMaskGenerator()(inputs)
     embeddings = layers.TokenPosEmbedding(d_vocab=vocab_size, d_model=d_model, pos_length=max_seq_len, scale=d_model**0.5)(inputs)

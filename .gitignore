@@ -5,6 +5,8 @@ data/*.raw
 data/text8
 data/*.tgz
 *.h5
+*.zip
+logs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

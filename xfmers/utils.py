@@ -1,6 +1,6 @@
 import tensorflow.compat.v2 as tf
 import tensorflow.keras.backend as K
-import math
+import time
     
 
 def perplexity(y_true, y_pred):
@@ -20,10 +20,19 @@ class NoamSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
         super(NoamSchedule, self).__init__()
         self.warmup_steps = warmup_steps
         self.k = self.warmup_steps**-1.5
-        self.sqrt_d_model = 1/(d_model**0.5)
+        self.rsqrt_d_model = 1/(d_model**0.5)
 
     def __call__(self, step):
         arg1 = tf.math.rsqrt(step)
         arg2 = step * (self.k)
-        return self.sqrt_d_model * tf.math.minimum(arg1, arg2)
+        return self.rsqrt_d_model * tf.math.minimum(arg1, arg2)
+    
+    
+class TimeHistory(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs={}):
+        self.times = []
+    def on_epoch_begin(self, epoch, logs={}):
+        self.epoch_time_start = time.time()
+    def on_epoch_end(self, epoch, logs={}):
+        self.times.append(time.time() - self.epoch_time_start)
     

@@ -1,3 +1,11 @@
+.DS_Store
+data/*.txt
+data/*.zip
+data/*.raw
+data/text8
+data/*.tgz
+*.h5
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

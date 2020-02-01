@@ -30,7 +30,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         self.depth = self.d_model // self.num_heads
         
         self.query_dense = tf.keras.layers.Dense(units=self.d_model)
-        if shared_qk:
+        if self.shared_qk:
             self.key_dense = self.query_dense
         else:
             self.key_dense = tf.keras.layers.Dense(units=self.d_model)
@@ -90,7 +90,8 @@ class TransformerLayer(tf.keras.models.Model):
     """
     Single Transformer block implementing MHA
     """
-    def __init__(self, ff_units, d_model, num_heads, dropout, causal=False, efficient_attention=False, shared_qk=False, activation="relu", name="TransformerLayer"):
+    def __init__(self, ff_units, d_model, num_heads, dropout, causal=False, conv_filter=1, conv_padding="same",
+                 efficient_attention=False, shared_qk=False, activation="relu", name="TransformerLayer"):
         """
         Initialize single Transformer layer
         Args:
@@ -115,14 +116,16 @@ class TransformerLayer(tf.keras.models.Model):
         self.efficient_attention = efficient_attention
         self.shared_qk = shared_qk
         self.activation = activation
+        self.conv_filter = conv_filter
+        self.conv_padding = conv_padding
         self.mha = MultiHeadAttention(self.d_model, self.num_heads,
                                       causal=self.causal, efficient=self.efficient_attention, shared_qk=self.shared_qk,
                                       name=self.name+"_MultiHeadAttention")
         self.dropout_1 = tf.keras.layers.Dropout(rate=self.dropout)
         self.layer_norm_1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.ffn_1 = tf.keras.layers.Dense(units=self.ff_units)
-        self.relu = tf.keras.layers.Activation(self.activation)
-        self.ffn_2 = tf.keras.layers.Dense(units=self.d_model)
+        self.ffn_1 = tf.keras.layers.Conv1D(filters=self.ff_units, kernel_size=self.conv_filter, padding=self.conv_padding)
+        self.act = tf.keras.layers.Activation(self.activation)
+        self.ffn_2 = tf.keras.layers.Conv1D(filters=self.d_model, kernel_size=self.conv_filter, padding=self.conv_padding)
         self.dropout_2 = tf.keras.layers.Dropout(rate=self.dropout)
         self.layer_norm_2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
     
@@ -137,7 +140,7 @@ class TransformerLayer(tf.keras.models.Model):
         
         attention = self.layer_norm_1(attention)
         
-        outputs = self.ffn_2(self.relu(self.ffn_1(attention)))
+        outputs = self.ffn_2(self.act(self.ffn_1(attention)))
         outputs = self.dropout_2(outputs)
         
         outputs = self.layer_norm_2(outputs)
@@ -150,14 +153,99 @@ class TransformerLayer(tf.keras.models.Model):
                 "num_heads": self.num_heads,
                 "dropout": self.dropout,
                 "causal": self.causal,
+                "conv_padding": self.conv_padding,
+                "conv_filter": self.conv_filter,
                 "activation": self.activation}
+    
+    
+class RevTransformerLayer(tf.keras.Model):
+    def __init__(self, ff_units, d_model, num_heads, dropout, name="RevTransformerLayer",
+                 causal=False, conv_filter=1, conv_padding="same",
+                 efficient_attention=False, shared_qk=False, activation="relu"):
+        super(RevTransformerLayer, self).__init__(name=name)
+        assert d_model%2 == 0
+        assert num_heads%2 == 0
+        self.ff_units = ff_units
+        self.d_model = int(d_model/2)
+        self.num_heads = int(num_heads/2)
+        self.dropout = dropout
+        self.causal = causal
+        self.conv_filter = conv_filter
+        self.conv_padding = conv_padding
+        self.efficient_attention = efficient_attention
+        self.shared_qk = shared_qk
+        self.activation = activation
+        self.f = TransformerLayer(ff_units=self.ff_units,
+                                  d_model=self.d_model,
+                                  num_heads=self.num_heads,
+                                  dropout=self.dropout,
+                                  causal=self.causal,
+                                  conv_filter=self.conv_filter,
+                                  conv_padding=self.conv_padding,
+                                  activation=self.activation,
+                                  efficient_attention=self.efficient_attention,
+                                  shared_qk=self.shared_qk,
+                                  name=self.name+"_F")
+        self.g = TransformerLayer(ff_units=self.ff_units,
+                                  d_model=self.d_model,
+                                  num_heads=self.num_heads,
+                                  dropout=self.dropout,
+                                  causal=self.causal,
+                                  conv_filter=self.conv_filter,
+                                  conv_padding=self.conv_padding,
+                                  activation=self.activation,
+                                  efficient_attention=self.efficient_attention,
+                                  shared_qk=self.shared_qk,
+                                  name=self.name+"_G")
+        
+    def call(self, inputs):
+        token_inputs, mask = inputs["token_inputs"], inputs["mask_inputs"]
+        token_inputs_1, token_inputs_2 = tf.split(token_inputs, num_or_size_splits=2, axis=-1)
+        
+        f_x2 = self.f(({"token_inputs": token_inputs_2,
+                        "mask_inputs": mask}))
+        y1 = f_x2 + token_inputs_1
+        g_y1 = self.g(({"token_inputs": y1,
+                        "mask_inputs": mask}))
+        y2 = g_y1 + token_inputs_2
+        return tf.concat([y1, y2], axis=-1)
+    
+    def backward_grads(self, y, dy, training=True):
+        dy1, dy2 = dy
+        y1, y2 = y
+
+        with tf.GradientTape() as gtape:
+            gtape.watch(y1)
+            gy1 = self.g(y1, training=training)
+        grads_combined = gtape.gradient(gy1, [y1] + self.g.trainable_variables,
+                                        output_gradients=dy2)
+        dg = grads_combined[1:]
+        dx1 = dy1 + grads_combined[0]
+        x2 = y2 - gy1
+
+        with tf.GradientTape() as ftape:
+            ftape.watch(x2)
+            fx2 = self.f(x2, training=training)
+        grads_combined = ftape.gradient(fx2, [x2] + self.f.trainable_variables,
+                                        output_gradients=dx1)
+        df = grads_combined[1:]
+        dx2 = dy2 + grads_combined[0]
+        x1 = y1 - fx2
+
+        x = x1, x2
+        dx = dx1, dx2
+        grads = df + dg
+
+        return x, dx, grads
 
     
 class TransformerStack(tf.keras.models.Model):
     """
     Build a stack of Transformer layers as Encoder/Decoder
     """
-    def __init__(self, layers, ff_units, d_model, num_heads, dropout, causal=False, efficient_attention=False, shared_qk=False, activation="relu", weight_sharing=False, name="TransformerStack"):
+    def __init__(self, layers, ff_units, d_model, num_heads, dropout, causal=False, conv_filter=1, conv_padding="same",
+                 efficient_attention=False, shared_qk=False, activation="relu", weight_sharing=False, reversible=False,
+                 name="TransformerStack"):
         """
         Initialize Transformer layer stack
         Args:
@@ -186,31 +274,43 @@ class TransformerStack(tf.keras.models.Model):
         self.shared_qk = shared_qk
         self.activation = activation
         self.weight_sharing = weight_sharing
+        self.conv_filter = conv_filter
+        self.conv_padding = conv_padding
+        self.reversible = reversible
+        
+        if self.reversible:
+            TLayer = RevTransformerLayer
+        else:
+            TLayer = TransformerLayer
         
         if self.weight_sharing:
             # create one layer and re-use
-            self.xfmer_layer = TransformerLayer(ff_units=self.ff_units,
-                                                d_model=self.d_model,
-                                                num_heads=self.num_heads,
-                                                dropout=self.dropout,
-                                                causal=self.causal,
-                                                efficient_attention=self.efficient_attention,
-                                                shared_qk=self.shared_qk,
-                                                activation=self.activation,
-                                                name=self.name+"_Layer")
+            self.xfmer_layer = TLayer(ff_units=self.ff_units,
+                                      d_model=self.d_model,
+                                      num_heads=self.num_heads,
+                                      dropout=self.dropout,
+                                      causal=self.causal,
+                                      efficient_attention=self.efficient_attention,
+                                      shared_qk=self.shared_qk,
+                                      activation=self.activation,
+                                      conv_filter=self.conv_filter,
+                                      conv_padding=self.conv_padding,
+                                      name=self.name+"_Layer")
             self.xfmer_layers = [self.xfmer_layer for i in range(self.tlayers)]
         else:
             # create a list of layers
             self.xfmer_layers = [
-                TransformerLayer(ff_units=self.ff_units,
-                                 d_model=self.d_model,
-                                 num_heads=self.num_heads,
-                                 dropout=self.dropout,
-                                 causal=self.causal,
-                                 efficient_attention=self.efficient_attention,
-                                 shared_qk=self.shared_qk,
-                                 activation=self.activation,
-                                 name=self.name+"_Layer_"+str(i+1)) for i in range(self.tlayers)
+                TLayer(ff_units=self.ff_units,
+                       d_model=self.d_model,
+                       num_heads=self.num_heads,
+                       dropout=self.dropout,
+                       causal=self.causal,
+                       efficient_attention=self.efficient_attention,
+                       shared_qk=self.shared_qk,
+                       activation=self.activation,
+                       conv_filter=self.conv_filter,
+                       conv_padding=self.conv_padding,
+                       name=self.name+"_Layer_"+str(i+1)) for i in range(self.tlayers)
             ]
     
     def call(self, inputs):
@@ -230,6 +330,8 @@ class TransformerStack(tf.keras.models.Model):
                 "dropout": self.dropout,
                 "causal": self.causal,
                 "activation": self.activation,
+                "efficient_attention": self.efficient_attention,
+                "shared_qk": self.shared_qk,
                 "weight_sharing": self.weight_sharing}
     
 

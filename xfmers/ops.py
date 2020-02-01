@@ -3,16 +3,11 @@ import tensorflow.compat.v2 as tf
 
 def scaled_dot_product_attention(query, key, value, mask):
     matmul_qk = tf.matmul(query, key, transpose_b=True)
-    # scale matmul_qk
     depth = tf.cast(tf.shape(key)[-1], matmul_qk.dtype)
     logits = matmul_qk / tf.math.sqrt(depth)
-    # add the mask to zero out padding tokens
     mask = tf.cast(mask, logits.dtype)
     logits += (mask * -1e9)
-    # softmax is normalized on the last axis (seq_len_k)
     attention_weights = tf.nn.softmax(logits, axis=-1)
-    # sns.heatmap(attention_weights.numpy()[0,0,:,:])
-    # plt.show()
     output = tf.matmul(attention_weights, value)
     return output
 
@@ -25,27 +20,36 @@ def efficient_attention(query, key, value, mask):
     matmul_vk = tf.matmul(value, key, transpose_b=True)
     depth = tf.cast(tf.shape(key)[-1], matmul_qk.dtype)
     logits = matmul_vk / tf.math.sqrt(depth)
-    # add the mask to zero out padding tokens
     mask = tf.cast(mask, logits.dtype)
     logits += (mask * -1e9)
-    # softmax is normalized on the last axis (seq_len_k)
     attention_weights = tf.nn.softmax(logits, axis=-1)
-    # sns.heatmap(attention_weights.numpy()[0,0,:,:])
-    # plt.show()
     output = tf.matmul(attention_weights, query)
     return output
 
 
-
 def gelu(x):
-    """ Gaussian Error Linear Unit.
-    Original Implementation of the gelu activation function in Google Bert repo when initially created.
-        For information: OpenAI GPT's gelu is slightly different (and gives slightly different results):
-        0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
-        Also see https://arxiv.org/abs/1606.08415
+    """
+    Gaussian Error Linear Unit
+    https://arxiv.org/abs/1606.08415
     """
     cdf = 0.5 * (1.0 + tf.math.erf(x / 1.4142135623730951))
     return x * cdf
+
+
+def swish(x):
+    """
+    Swish: Self-Gated Activation Function, discovered via reinforcement learning
+    https://arxiv.org/abs/1710.05941
+    """
+    return x * tf.math.sigmoid(x)
+
+
+def mish(x):
+    """
+    Mish: A Self Regularized Non-Monotonic Neural Activation Function
+    https://arxiv.org/abs/1908.08681
+    """
+    return x * tf.math.tanh(tf.math.log((1 + tf.math.exp(x))))
 
 
 def causal_attention_mask(size):

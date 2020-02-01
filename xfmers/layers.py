@@ -153,6 +153,8 @@ class TransformerLayer(tf.keras.models.Model):
                 "num_heads": self.num_heads,
                 "dropout": self.dropout,
                 "causal": self.causal,
+                "efficient_attention": self.efficient_attention,
+                "shared_qk": self.shared_qk,
                 "conv_padding": self.conv_padding,
                 "conv_filter": self.conv_filter,
                 "activation": self.activation}
@@ -237,6 +239,18 @@ class RevTransformerLayer(tf.keras.Model):
         grads = df + dg
 
         return x, dx, grads
+    
+    def get_config(self):
+        return {"ff_units": self.ff_units,
+                "d_model": self.d_model,
+                "num_heads": self.num_heads,
+                "dropout": self.dropout,
+                "causal": self.causal,
+                "efficient_attention": self.efficient_attention,
+                "shared_qk": self.shared_qk,
+                "conv_padding": self.conv_padding,
+                "conv_filter": self.conv_filter,
+                "activation": self.activation}
 
     
 class TransformerStack(tf.keras.models.Model):

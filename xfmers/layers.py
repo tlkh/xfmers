@@ -114,10 +114,6 @@ class MultiHeadAttentionFusedQKV(tf.keras.layers.Layer):
         self.depth = self.d_model // self.num_heads
 
         self.fused_qkv = tf.keras.layers.Dense(units=self.d_model*3)
-        # replaces the following:
-        # self.query_dense = tf.keras.layers.Dense(units=self.d_model)
-        # self.key_dense = tf.keras.layers.Dense(units=self.d_model)
-        # self.value_dense = tf.keras.layers.Dense(units=self.d_model)
         
         self.final_linear = tf.keras.layers.Dense(units=self.d_model)
         
@@ -518,32 +514,6 @@ class PaddingMaskGenerator(tf.keras.layers.Layer):
     
     def get_config(self):
         return {}
-
-    
-class LMHead(tf.keras.layers.Layer):
-    """
-    Language Modelling Head
-    """
-    def __init__(self, vocab_size, name="LMHead"):
-        """
-        LMHead
-        Args:
-            None
-        Inputs:
-            token_inputs: 1D Tensor of integer numbers
-        Outputs:
-            N-D tensor
-        """
-        super(LMHead, self).__init__(name=name)
-        self.vocab_size = vocab_size
-        self.dense_softmax = tf.keras.layers.Dense(units=self.vocab_size, activation="softmax")
-        
-    def call(self, inputs):
-        return self.dense_softmax(inputs[:,-1])
-    
-    def get_config(self):
-        return {"vocab_size": self.vocab_size}
-
     
 class UnsortLogits(tf.keras.layers.Layer):
     def __init__(self):

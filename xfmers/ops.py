@@ -3,9 +3,9 @@ import tensorflow.compat.v2 as tf
 
 def scaled_dot_product_attention(query, key, value, mask):
     matmul_qk = tf.matmul(query, key, transpose_b=True)
-    depth = tf.cast(tf.shape(key)[-1], matmul_qk.dtype)
+    depth = tf.cast(tf.shape(key)[-1], tf.float32)
     logits = matmul_qk / tf.math.sqrt(depth)
-    mask = tf.cast(mask, logits.dtype)
+    mask = tf.cast(mask, tf.float32)
     logits += (mask * -1e9)
     attention_weights = tf.nn.softmax(logits, axis=-1)
     output = tf.matmul(attention_weights, value)
@@ -18,9 +18,9 @@ def efficient_attention(query, key, value, mask):
     https://arxiv.org/abs/1812.01243
     """
     matmul_vk = tf.matmul(value, key, transpose_b=True)
-    depth = tf.cast(tf.shape(key)[-1], matmul_qk.dtype)
+    depth = tf.cast(tf.shape(key)[-1], tf.float32)
     logits = matmul_vk / tf.math.sqrt(depth)
-    mask = tf.cast(mask, logits.dtype)
+    mask = tf.cast(mask, tf.float32)
     logits += (mask * -1e9)
     attention_weights = tf.nn.softmax(logits, axis=-1)
     output = tf.matmul(attention_weights, query)

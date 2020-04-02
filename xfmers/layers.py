@@ -3,7 +3,7 @@ from . import ops
 
 
 
-class MultiHeadAttention(tf.keras.layers.Layer):
+class MultiHeadAttention(tf.keras.models.Model):
     """
     Multi-head Attention (MHA) block
     """
@@ -30,13 +30,25 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         assert self.d_model % self.num_heads == 0
         self.depth = self.d_model // self.num_heads
         
-        self.query_dense = tf.keras.layers.Dense(units=self.d_model)
+        self.query_dense = tf.keras.layers.Dense(units=self.d_model,
+                                                 kernel_initializer=ops.get_initializer(0.02),
+                                                 kernel_regularizer=tf.keras.regularizers.l2(0.00001),
+                                                 name="d_query")
         if self.shared_qk:
             self.key_dense = self.query_dense
         else:
-            self.key_dense = tf.keras.layers.Dense(units=self.d_model)
-        self.value_dense = tf.keras.layers.Dense(units=self.d_model)
-        self.final_linear = tf.keras.layers.Dense(units=self.d_model)
+            self.key_dense = tf.keras.layers.Dense(units=self.d_model,
+                                                   kernel_initializer=ops.get_initializer(0.02),
+                                                   kernel_regularizer=tf.keras.regularizers.l2(0.00001),
+                                                   name="d_key")
+        self.value_dense = tf.keras.layers.Dense(units=self.d_model,
+                                                 kernel_initializer=ops.get_initializer(0.02),
+                                                 kernel_regularizer=tf.keras.regularizers.l2(0.00001),
+                                                 name="d_value")
+        self.final_linear = tf.keras.layers.Dense(units=self.d_model,
+                                                  kernel_initializer=ops.get_initializer(0.02),
+                                                  kernel_regularizer=tf.keras.regularizers.l2(0.00001),
+                                                  name="d_mha_final")
         
         if self.efficient:
             self.attention_op = ops.efficient_attention
@@ -49,12 +61,12 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         return tf.transpose(inputs, perm=[0, 2, 1, 3])
 
     def call(self, inputs):
-        query, key, value, mask = inputs["query"], inputs["key"], inputs["value"], inputs["mask"]
+        token_inputs, mask = inputs["token_inputs"], inputs["mask"]
         
         # linear layers
-        query = self.query_dense(query)
-        key = self.key_dense(key)
-        value = self.value_dense(value)
+        query = self.query_dense(token_inputs)
+        key = self.key_dense(token_inputs)
+        value = self.value_dense(token_inputs)
         # shape: (batch, seq, d_model)
 
         # split heads
@@ -76,6 +88,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         # concatenation of heads
         concat_attention = tf.reshape(scaled_attention,
                                       (batch_size, -1, self.d_model))
+        
         # final linear layer
         outputs = self.final_linear(concat_attention)
         return outputs
@@ -88,7 +101,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
                 "causal": self.causal}
     
 
-class MultiHeadAttentionFusedQKV(tf.keras.layers.Layer):
+class MultiHeadAttentionFusedQKV(tf.keras.models.Model):
     """
     Multi-head Attention (MHA) block with fused QKV operation
     """
@@ -114,9 +127,13 @@ class MultiHeadAttentionFusedQKV(tf.keras.layers.Layer):
         assert self.d_model % self.num_heads == 0
         self.depth = self.d_model // self.num_heads
 
-        self.fused_qkv = tf.keras.layers.Dense(units=self.d_model*3)
+        self.fused_qkv = tf.keras.layers.Dense(units=self.d_model*3,
+                                               kernel_initializer=ops.get_initializer(0.02),
+                                               kernel_regularizer=tf.keras.regularizers.l2(0.00001))
         
-        self.final_linear = tf.keras.layers.Dense(units=self.d_model)
+        self.final_linear = tf.keras.layers.Dense(units=self.d_model,
+                                                  kernel_initializer=ops.get_initializer(0.02),
+                                                  kernel_regularizer=tf.keras.regularizers.l2(0.00001))
         
         if self.efficient:
             self.attention_op = ops.efficient_attention
@@ -129,12 +146,11 @@ class MultiHeadAttentionFusedQKV(tf.keras.layers.Layer):
         return tf.transpose(inputs, perm=[0, 2, 1, 3])
 
     def call(self, inputs):
-        query, key, value, mask = inputs["query"], inputs["key"], inputs["value"], inputs["mask"]
+        token_inputs, mask = inputs["token_inputs"], inputs["mask"]
         # shape: (batch, seq, d_model)
         
         # fused qkv operation
-        fused_input = tf.concat([query, key, value], axis=-1, name="concat_for_qkv")
-        qkv = self.fused_qkv(fused_input)
+        qkv = self.fused_qkv(token_inputs)
         query, key, value = tf.split(qkv, num_or_size_splits=3, axis=-1, num=3, name="split_after_qkv")
 
         # split heads
@@ -201,27 +217,29 @@ class TransformerLayer(tf.keras.models.Model):
         self.conv_padding = conv_padding
         self.fused_qkv = fused_qkv
         if self.fused_qkv:
-            self.mha = MultiHeadAttention(self.d_model, self.num_heads,
-                                          causal=self.causal, efficient=self.efficient_attention, shared_qk=self.shared_qk,
-                                          name=self.name+"_MultiHeadAttention")
-        else:
             self.mha = MultiHeadAttentionFusedQKV(self.d_model, self.num_heads,
                                                   causal=self.causal, efficient=self.efficient_attention,
                                                   name=self.name+"_MultiHeadAttention")
+        else:
+            self.mha = MultiHeadAttention(self.d_model, self.num_heads,
+                                          causal=self.causal, efficient=self.efficient_attention, shared_qk=self.shared_qk,
+                                          name=self.name+"_MultiHeadAttention")
         self.dropout_1 = tf.keras.layers.Dropout(rate=self.dropout)
         self.layer_norm_1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.ffn_1 = tf.keras.layers.Conv1D(filters=self.ff_units, kernel_size=self.conv_filter, padding=self.conv_padding)
+        self.ffn_1 = tf.keras.layers.Conv1D(filters=self.ff_units, kernel_size=self.conv_filter,
+                                            kernel_initializer=ops.get_initializer(0.02),
+                                            padding=self.conv_padding, kernel_regularizer=tf.keras.regularizers.l2(0.00001))
         self.act = tf.keras.layers.Activation(self.activation)
-        self.ffn_2 = tf.keras.layers.Conv1D(filters=self.d_model, kernel_size=self.conv_filter, padding=self.conv_padding)
+        self.ffn_2 = tf.keras.layers.Conv1D(filters=self.d_model, kernel_size=self.conv_filter,
+                                            kernel_initializer=ops.get_initializer(0.02),
+                                            padding=self.conv_padding, kernel_regularizer=tf.keras.regularizers.l2(0.00001))
         self.dropout_2 = tf.keras.layers.Dropout(rate=self.dropout)
         self.layer_norm_2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
     
     def call(self, inputs):
         token_inputs, mask = inputs["token_inputs"], inputs["mask_inputs"]
             
-        attention = self.mha({"query": token_inputs,
-                              "key": token_inputs,
-                              "value": token_inputs,
+        attention = self.mha({"token_inputs": token_inputs,
                               "mask": mask})
         attention = token_inputs + self.dropout_1(attention)
         
@@ -230,7 +248,7 @@ class TransformerLayer(tf.keras.models.Model):
         outputs = self.ffn_2(self.act(self.ffn_1(attention)))
         outputs = self.dropout_2(outputs)
         
-        outputs = self.layer_norm_2(outputs)
+        outputs = self.layer_norm_2(attention + outputs)
             
         return outputs
     
@@ -467,10 +485,20 @@ class TokenPosEmbedding(tf.keras.layers.Layer):
         self.scale = scale
         self.d_projection = d_projection
         
-        self.token_embeddings = tf.keras.layers.Embedding(self.d_vocab, self.d_model)
-        self.pos_embeddings = tf.keras.layers.Embedding(self.pos_length, self.d_model)
+        self.token_embeddings = tf.keras.layers.Embedding(self.d_vocab,
+                                                          self.d_model,
+                                                          embeddings_initializer=ops.get_initializer(0.02),
+                                                          name="token_embedding",)
+        self.pos_embeddings = tf.keras.layers.Embedding(self.pos_length,
+                                                        self.d_model,
+                                                        embeddings_initializer=ops.get_initializer(0.02),
+                                                        name="token_embedding",)
         if self.d_projection:
-            self.projection = tf.keras.layers.Dense(units=self.d_projection)
+            self.projection = tf.keras.layers.Dense(units=self.d_projection,
+                                                    kernel_initializer=ops.get_initializer(0.02),
+                                                    kernel_regularizer=tf.keras.regularizers.l2(0.00001))
+            
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
 
     def call(self, inputs):
         pos_range = ops.position_range(tf.shape(inputs)[-1])
@@ -483,6 +511,8 @@ class TokenPosEmbedding(tf.keras.layers.Layer):
         
         if self.d_projection:
             embeddings = self.projection(embeddings)
+            
+        embeddings = self.layer_norm(embeddings)
         
         return embeddings
     

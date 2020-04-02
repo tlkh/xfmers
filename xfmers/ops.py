@@ -1,4 +1,11 @@
-import tensorflow.compat.v2 as tf
+import tensorflow as tf
+
+
+def get_initializer(initializer_range=0.02):
+    """
+    Creates a `tf.initializers.truncated_normal` with the given range.
+    """
+    return tf.keras.initializers.TruncatedNormal(stddev=initializer_range)
 
 
 def scaled_dot_product_attention(query, key, value, mask):

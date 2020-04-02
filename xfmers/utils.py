@@ -11,8 +11,8 @@ def perplexity(y_true, y_pred):
 
 
 def bpc(y_true, y_pred):
-    y_pred = tf.keras.activations.softmax(y_pred)
-    cross_entropy = K.sparse_categorical_crossentropy(y_true, y_pred)
+    y_pred = tf.keras.activations.softmax(y_pred[:,-1])
+    cross_entropy = K.sparse_categorical_crossentropy(y_true[:,-1], y_pred)
     _bpc = cross_entropy / 0.69314718056 # ln2
     return _bpc
     
@@ -37,7 +37,7 @@ class WarmupExpDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
         self.base_lr = base_lr
         self.warmup_steps = warmup_epochs * epoch_steps
         self.flat_steps = flat_epochs * epoch_steps
-        self.max_steps = (max_epochs + 1) * epoch_steps
+        self.max_steps = (max_epochs) * epoch_steps
         self.offset = self.max_steps + self.flat_steps
         self.min_lr = min_lr
         self.decay_exp = decay_exp

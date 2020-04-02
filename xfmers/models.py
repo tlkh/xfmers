@@ -8,7 +8,7 @@ def Transformer(vocab_size, dec_layers, ff_units, d_model, num_heads, dropout, m
                        conv_filter=1, conv_padding="same", reversible=False, fused_qkv=False, name="Transformer"):
     inputs = tf.keras.Input(shape=(None, ), name="inputs")
     padding_mask = layers.PaddingMaskGenerator()(inputs)
-    embeddings = layers.TokenPosEmbedding(d_vocab=vocab_size, d_model=d_model, pos_length=max_seq_len, scale=d_model**0.5)(inputs)
+    embeddings = layers.TokenPosEmbedding(d_vocab=vocab_size, d_model=d_model, pos_length=max_seq_len, scale=1)(inputs)
     
     decoder_block = layers.TransformerStack(layers=dec_layers,
                                             ff_units=ff_units,
@@ -24,8 +24,10 @@ def Transformer(vocab_size, dec_layers, ff_units, d_model, num_heads, dropout, m
                                             fused_qkv=fused_qkv,
                                             name="DecoderBlock")
     dec_outputs = decoder_block({"token_inputs": embeddings,
-                                 "mask_inputs": padding_mask})[:,-1]
+                                 "mask_inputs": padding_mask})
     
-    preds = tf.keras.layers.Dense(vocab_size, name="outputs")(dec_outputs)
+    l_dropout = tf.keras.layers.Dropout(rate=dropout)(dec_outputs)
+    
+    preds = tf.keras.layers.Dense(vocab_size, name="outputs")(l_dropout)
     
     return tf.keras.Model(inputs=inputs, outputs=preds, name=name)

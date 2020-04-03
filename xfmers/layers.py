@@ -1,439 +1,211 @@
+import sys
 import tensorflow as tf
 from . import ops
 
 
-
-class MultiHeadAttention(tf.keras.models.Model):
-    """
-    Multi-head Attention (MHA) block
-    """
-    def __init__(self, d_model, num_heads, causal=False, efficient=False, shared_qk=False, name="MultiHeadAttention"):
+class MultiHeadAttention(tf.keras.layers.Layer):
+    def __init__(self, transformer_config, name="MultiHeadAttention"):
         """
-        Initialize MHA
-        Args:
-            d_model: (int) Dimension of hidden layers. Must be a multiple of `num_heads`
-            num_heads: (int) Number of attention heads
-            causal: (int) Disallow "looking into the future" by masking future time steps
-            efficient: (bool) Alternative efficient implementation (https://arxiv.org/abs/1812.01243)
-            shared_qk: (bool) Share Query and Key weights 
+        Multi-Head Attention (MHA) Layer
         Inputs:
-            inputs: (dict) Dictionary with keys "query", "key", "value", "mask"
+            inputs: (dict) Dictionary with keys "token_inputs", "mask"
         Outputs:
-            N-D tensor with shape: `(batch_size, ..., d_model)`
+            N-D tensor with shape: `(batch_size, ..., model_dim)`
         """
         super(MultiHeadAttention, self).__init__(name=name)
-        self.num_heads = num_heads
-        self.d_model = d_model
-        self.causal = causal
-        self.efficient = efficient
-        self.shared_qk = shared_qk
-        assert self.d_model % self.num_heads == 0
-        self.depth = self.d_model // self.num_heads
+        self.tconfig = transformer_config
+        self.fused_qkv = self.tconfig.fused_qkv
+        self.shared_qk = self.tconfig.shared_qk
+        self.model_dim = self.tconfig.model_dim
+        self.num_heads = self.tconfig.num_heads
+        self.causal = self.tconfig.causal
+        self.attention_mode = self.tconfig.attention_mode
+        self.initializer_range = self.tconfig.initializer_range
+        self.weight_decay = self.tconfig.weight_decay
         
-        self.query_dense = tf.keras.layers.Dense(units=self.d_model,
-                                                 kernel_initializer=ops.get_initializer(0.02),
-                                                 kernel_regularizer=tf.keras.regularizers.l2(0.00001),
-                                                 name="d_query")
-        if self.shared_qk:
-            self.key_dense = self.query_dense
+        self.depth = self.model_dim // self.num_heads
+        
+        if self.attention_mode == "normal":
+            self.attention_op = ops.scaled_dot_product_attention
+        elif self.attention_mode == "efficient":
+            self.attention_op = ops.efficient_attention
         else:
-            self.key_dense = tf.keras.layers.Dense(units=self.d_model,
-                                                   kernel_initializer=ops.get_initializer(0.02),
-                                                   kernel_regularizer=tf.keras.regularizers.l2(0.00001),
-                                                   name="d_key")
-        self.value_dense = tf.keras.layers.Dense(units=self.d_model,
-                                                 kernel_initializer=ops.get_initializer(0.02),
-                                                 kernel_regularizer=tf.keras.regularizers.l2(0.00001),
-                                                 name="d_value")
-        self.final_linear = tf.keras.layers.Dense(units=self.d_model,
-                                                  kernel_initializer=ops.get_initializer(0.02),
-                                                  kernel_regularizer=tf.keras.regularizers.l2(0.00001),
+            error_string = "Specified attention mode " + str(self.attention_mode) + " is not supported!"
+            raise NotImplementedError(error_string)
+        
+        if self.fused_qkv:
+            # combine q, k, v Dense layers into one Dense layer
+            if self.shared_qk:
+                # share params for q and k
+                qkv_units = self.model_dim*2 
+            else:
+                qkv_units = self.model_dim*3
+            self.fused_qkv = tf.keras.layers.Dense(units=qkv_units,
+                                                   kernel_initializer=ops.get_initializer(self.initializer_range),
+                                                   kernel_regularizer=tf.keras.regularizers.l2(),
+                                                   name="d_fused_qkv")
+        else:
+            self.query_dense = tf.keras.layers.Dense(units=self.model_dim,
+                                                     kernel_initializer=ops.get_initializer(self.initializer_range),
+                                                     kernel_regularizer=tf.keras.regularizers.l2(self.weight_decay),
+                                                     name="d_query")
+            if self.shared_qk:
+                self.key_dense = self.query_dense
+            else:
+                self.key_dense = tf.keras.layers.Dense(units=self.model_dim,
+                                                       kernel_initializer=ops.get_initializer(self.initializer_range),
+                                                       kernel_regularizer=tf.keras.regularizers.l2(self.weight_decay),
+                                                       name="d_key")
+            self.value_dense = tf.keras.layers.Dense(units=self.model_dim,
+                                                     kernel_initializer=ops.get_initializer(self.initializer_range),
+                                                     kernel_regularizer=tf.keras.regularizers.l2(self.weight_decay),
+                                                     name="d_value")
+        # final linear layer
+        self.final_linear = tf.keras.layers.Dense(units=self.model_dim,
+                                                  kernel_initializer=ops.get_initializer(self.initializer_range),
+                                                  kernel_regularizer=tf.keras.regularizers.l2(self.weight_decay),
                                                   name="d_mha_final")
         
-        if self.efficient:
-            self.attention_op = ops.efficient_attention
-        else:
-            self.attention_op = ops.scaled_dot_product_attention
-        
     def split_heads(self, inputs, batch_size):
         inputs = tf.reshape(inputs,
                             shape=(batch_size, -1, self.num_heads, self.depth))
         return tf.transpose(inputs, perm=[0, 2, 1, 3])
 
     def call(self, inputs):
+        # inputs shape: (batch, seq, model_dim)
         token_inputs, mask = inputs["token_inputs"], inputs["mask"]
         
-        # linear layers
-        query = self.query_dense(token_inputs)
-        key = self.key_dense(token_inputs)
-        value = self.value_dense(token_inputs)
-        # shape: (batch, seq, d_model)
+        if self.fused_qkv:
+            qkv = self.fused_qkv(token_inputs)
+            if self.shared_qk:
+                query, value = tf.split(qkv, num_or_size_splits=2, axis=-1, num=2, name="split_after_qkv")
+                key = query
+            else:
+                query, key, value = tf.split(qkv, num_or_size_splits=3, axis=-1, num=3, name="split_after_qkv")
+        else:
+            query = self.query_dense(token_inputs)
+            key = self.key_dense(token_inputs)
+            value = self.value_dense(token_inputs)
 
         # split heads
         batch_size = tf.shape(query)[0]
         query = self.split_heads(query, batch_size)
         key = self.split_heads(key, batch_size)
         value = self.split_heads(value, batch_size)
-        # shape: (batch, heads, seq, d_model//heads)
+        # shape: (batch, heads, seq, model_dim//heads)
 
         if self.causal:
             mask_len = tf.shape(mask)[-1]
             causal_mask = ops.causal_attention_mask(mask_len)
             mask += causal_mask
-
-        # scaled dot-product attention
+            
         scaled_attention = self.attention_op(query, key, value, mask)
         scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
 
         # concatenation of heads
         concat_attention = tf.reshape(scaled_attention,
-                                      (batch_size, -1, self.d_model))
-        
-        # final linear layer
+                                      (batch_size, -1, self.model_dim))
         outputs = self.final_linear(concat_attention)
         return outputs
     
     def get_config(self):
-        return {"d_model": self.d_model,
-                "num_heads": self.num_heads,
-                "efficient": self.efficient,
+        return {"fused_qkv": self.fused_qkv,
                 "shared_qk": self.shared_qk,
-                "causal": self.causal}
-    
-
-class MultiHeadAttentionFusedQKV(tf.keras.models.Model):
-    """
-    Multi-head Attention (MHA) block with fused QKV operation
-    """
-    def __init__(self, d_model, num_heads, causal=False, efficient=False, name="MultiHeadAttention"):
-        """
-        Initialize MHA
-        Args:
-            d_model: (int) Dimension of hidden layers. Must be a multiple of `num_heads`
-            num_heads: (int) Number of attention heads
-            causal: (int) Disallow "looking into the future" by masking future time steps
-            efficient: (bool) Alternative efficient implementation (https://arxiv.org/abs/1812.01243)
-            shared_qk: (bool) Share Query and Key weights 
-        Inputs:
-            inputs: (dict) Dictionary with keys "query", "key", "value", "mask"
-        Outputs:
-            N-D tensor with shape: `(batch_size, ..., d_model)`
-        """
-        super(MultiHeadAttentionFusedQKV, self).__init__(name=name)
-        self.num_heads = num_heads
-        self.d_model = d_model
-        self.causal = causal
-        self.efficient = efficient
-        assert self.d_model % self.num_heads == 0
-        self.depth = self.d_model // self.num_heads
-
-        self.fused_qkv = tf.keras.layers.Dense(units=self.d_model*3,
-                                               kernel_initializer=ops.get_initializer(0.02),
-                                               kernel_regularizer=tf.keras.regularizers.l2(0.00001))
-        
-        self.final_linear = tf.keras.layers.Dense(units=self.d_model,
-                                                  kernel_initializer=ops.get_initializer(0.02),
-                                                  kernel_regularizer=tf.keras.regularizers.l2(0.00001))
-        
-        if self.efficient:
-            self.attention_op = ops.efficient_attention
-        else:
-            self.attention_op = ops.scaled_dot_product_attention
-        
-    def split_heads(self, inputs, batch_size):
-        inputs = tf.reshape(inputs,
-                            shape=(batch_size, -1, self.num_heads, self.depth))
-        return tf.transpose(inputs, perm=[0, 2, 1, 3])
-
-    def call(self, inputs):
-        token_inputs, mask = inputs["token_inputs"], inputs["mask"]
-        # shape: (batch, seq, d_model)
-        
-        # fused qkv operation
-        qkv = self.fused_qkv(token_inputs)
-        query, key, value = tf.split(qkv, num_or_size_splits=3, axis=-1, num=3, name="split_after_qkv")
-
-        # split heads
-        batch_size = tf.shape(query)[0]
-        query = self.split_heads(query, batch_size)
-        key = self.split_heads(key, batch_size)
-        value = self.split_heads(value, batch_size)
-        # shape: (batch, heads, seq, d_model//heads)
-
-        if self.causal:
-            mask_len = tf.shape(mask)[-1]
-            causal_mask = ops.causal_attention_mask(mask_len)
-            mask += causal_mask
-
-        # scaled dot-product attention
-        scaled_attention = self.attention_op(query, key, value, mask)
-        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
-
-        # concatenation of heads
-        concat_attention = tf.reshape(scaled_attention,
-                                      (batch_size, -1, self.d_model))
-        # final linear layer
-        outputs = self.final_linear(concat_attention)
-        return outputs
-    
-    def get_config(self):
-        return {"d_model": self.d_model,
+                "model_dim": self.model_dim,
                 "num_heads": self.num_heads,
-                "efficient": self.efficient,
-                "causal": self.causal}
+                "causal": self.causal,
+                "attention_mode": self.attention_mode,
+                "initializer_range": self.initializer_range,
+                "weight_decay": self.weight_decay}
 
-
-class TransformerLayer(tf.keras.models.Model):
-    """
-    Single Transformer block implementing MHA
-    """
-    def __init__(self, ff_units, d_model, num_heads, dropout, causal=False, conv_filter=1, conv_padding="same",
-                 efficient_attention=False, shared_qk=False, activation="relu", fused_qkv=False, name="TransformerLayer"):
+    
+class TransformerLayer(tf.keras.layers.Layer):
+    def __init__(self, transformer_config, name="TransformerLayer"):
         """
-        Initialize single Transformer layer
-        Args:
-            d_model: (int) Dimension of hidden layers. Must be a multiple of `num_heads`
-            ff_units: (int) Dimension of hidden layer in positional feed-forward unit
-            num_heads: (int) Number of attention heads
-            dropout: (float) dropout rate after MHA and feed-forward net
-            causal: (int) Disallow MHA "looking into the future" by masking future time steps
-            layer_norm: (string) Configuration of layer normalization. Defaults to "single" (GPT-2-like) or "double" (GPT-like)
-            activation: (string) Activation function to use inside feed-forward net. Defaults to "relu"
+        Single Transformer block implementing MHA
         Inputs:
             inputs: (dict) Dictionary with keys "token_inputs" and "mask_inputs"
         Outputs:
-            N-D tensor with shape: `(batch_size, ..., d_model)`
+            N-D tensor with shape: `(batch_size, ..., model_dim)`
         """
         super(TransformerLayer, self).__init__(name=name)
-        self.ff_units = ff_units
-        self.d_model = d_model
-        self.dropout = dropout
-        self.num_heads = num_heads
-        self.causal = causal
-        self.efficient_attention = efficient_attention
-        self.shared_qk = shared_qk
-        self.activation = activation
-        self.conv_filter = conv_filter
-        self.conv_padding = conv_padding
-        self.fused_qkv = fused_qkv
-        if self.fused_qkv:
-            self.mha = MultiHeadAttentionFusedQKV(self.d_model, self.num_heads,
-                                                  causal=self.causal, efficient=self.efficient_attention,
-                                                  name=self.name+"_MultiHeadAttention")
-        else:
-            self.mha = MultiHeadAttention(self.d_model, self.num_heads,
-                                          causal=self.causal, efficient=self.efficient_attention, shared_qk=self.shared_qk,
-                                          name=self.name+"_MultiHeadAttention")
+        self.tconfig = transformer_config
+        self.ffn_dim = self.tconfig.ffn_dim
+        self.model_dim = self.tconfig.model_dim
+        self.dropout = self.tconfig.dropout
+        self.activation = self.tconfig.activation
+        self.conv1d_kernel = self.tconfig.conv1d_kernel
+        self.conv1d_padding = self.tconfig.conv1d_padding
+        self.epsilon = self.tconfig.epsilon
+        self.initializer_range = self.tconfig.initializer_range
+        self.weight_decay = self.tconfig.weight_decay
+        
+        self.mha = MultiHeadAttention(self.tconfig, name=self.name+"_MultiHeadAttention")
         self.dropout_1 = tf.keras.layers.Dropout(rate=self.dropout)
-        self.layer_norm_1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.ffn_1 = tf.keras.layers.Conv1D(filters=self.ff_units, kernel_size=self.conv_filter,
-                                            kernel_initializer=ops.get_initializer(0.02),
-                                            padding=self.conv_padding, kernel_regularizer=tf.keras.regularizers.l2(0.00001))
+        self.layer_norm_1 = tf.keras.layers.LayerNormalization(epsilon=self.epsilon)
+        self.ffn_1 = tf.keras.layers.Conv1D(filters=self.ffn_dim, kernel_size=self.conv1d_kernel,
+                                            kernel_initializer=ops.get_initializer(self.initializer_range),
+                                            padding=self.conv1d_padding,
+                                            kernel_regularizer=tf.keras.regularizers.l2(self.weight_decay))
         self.act = tf.keras.layers.Activation(self.activation)
-        self.ffn_2 = tf.keras.layers.Conv1D(filters=self.d_model, kernel_size=self.conv_filter,
-                                            kernel_initializer=ops.get_initializer(0.02),
-                                            padding=self.conv_padding, kernel_regularizer=tf.keras.regularizers.l2(0.00001))
+        self.ffn_2 = tf.keras.layers.Conv1D(filters=self.model_dim, kernel_size=self.conv1d_kernel,
+                                            kernel_initializer=ops.get_initializer(self.initializer_range),
+                                            padding=self.conv1d_padding,
+                                            kernel_regularizer=tf.keras.regularizers.l2(self.weight_decay))
         self.dropout_2 = tf.keras.layers.Dropout(rate=self.dropout)
-        self.layer_norm_2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layer_norm_2 = tf.keras.layers.LayerNormalization(epsilon=self.epsilon)
     
     def call(self, inputs):
         token_inputs, mask = inputs["token_inputs"], inputs["mask_inputs"]
             
-        attention = self.mha({"token_inputs": token_inputs,
-                              "mask": mask})
-        attention = token_inputs + self.dropout_1(attention)
+        mha_output = self.mha({"token_inputs": token_inputs,
+                               "mask": mask})
+        mha_output = self.dropout_1(mha_output)
         
-        attention = self.layer_norm_1(attention)
+        mha_residual = self.layer_norm_1(token_inputs + mha_output)
         
-        outputs = self.ffn_2(self.act(self.ffn_1(attention)))
-        outputs = self.dropout_2(outputs)
+        ffn_output = self.ffn_2(self.act(self.ffn_1(mha_residual)))
+        ffn_output = self.dropout_2(ffn_output)
         
-        outputs = self.layer_norm_2(attention + outputs)
+        outputs = self.layer_norm_2(mha_residual + ffn_output)
             
         return outputs
     
     def get_config(self):
-        return {"ff_units": self.ff_units,
-                "d_model": self.d_model,
-                "num_heads": self.num_heads,
+        return {"ffn_dim": self.ffn_dim,
+                "model_dim": self.model_dim,
                 "dropout": self.dropout,
-                "causal": self.causal,
-                "efficient_attention": self.efficient_attention,
-                "shared_qk": self.shared_qk,
-                "conv_padding": self.conv_padding,
-                "conv_filter": self.conv_filter,
-                "fused_qkv": self.fused_qkv,
-                "activation": self.activation}
+                "conv1d_padding": self.conv1d_padding,
+                "conv1d_kernel": self.conv1d_kernel,
+                "activation": self.activation,
+                "epsilon": self.epsilon,
+                "initializer_range": self.initializer_range,
+                "weight_decay": self.weight_decay}
     
-    
-class RevTransformerLayer(tf.keras.Model):
-    def __init__(self, ff_units, d_model, num_heads, dropout, name="RevTransformerLayer",
-                 causal=False, conv_filter=1, conv_padding="same",
-                 efficient_attention=False, shared_qk=False, activation="relu"):
-        super(RevTransformerLayer, self).__init__(name=name)
-        assert d_model%2 == 0
-        assert num_heads%2 == 0
-        self.ff_units = ff_units
-        self.d_model = int(d_model/2)
-        self.num_heads = int(num_heads/2)
-        self.dropout = dropout
-        self.causal = causal
-        self.conv_filter = conv_filter
-        self.conv_padding = conv_padding
-        self.efficient_attention = efficient_attention
-        self.shared_qk = shared_qk
-        self.activation = activation
-        self.f = TransformerLayer(ff_units=self.ff_units,
-                                  d_model=self.d_model,
-                                  num_heads=self.num_heads,
-                                  dropout=self.dropout,
-                                  causal=self.causal,
-                                  conv_filter=self.conv_filter,
-                                  conv_padding=self.conv_padding,
-                                  activation=self.activation,
-                                  efficient_attention=self.efficient_attention,
-                                  shared_qk=self.shared_qk,
-                                  name=self.name+"_F")
-        self.g = TransformerLayer(ff_units=self.ff_units,
-                                  d_model=self.d_model,
-                                  num_heads=self.num_heads,
-                                  dropout=self.dropout,
-                                  causal=self.causal,
-                                  conv_filter=self.conv_filter,
-                                  conv_padding=self.conv_padding,
-                                  activation=self.activation,
-                                  efficient_attention=self.efficient_attention,
-                                  shared_qk=self.shared_qk,
-                                  name=self.name+"_G")
-        
-    def call(self, inputs):
-        token_inputs, mask = inputs["token_inputs"], inputs["mask_inputs"]
-        token_inputs_1, token_inputs_2 = tf.split(token_inputs, num_or_size_splits=2, axis=-1)
-        
-        f_x2 = self.f(({"token_inputs": token_inputs_2,
-                        "mask_inputs": mask}))
-        y1 = f_x2 + token_inputs_1
-        g_y1 = self.g(({"token_inputs": y1,
-                        "mask_inputs": mask}))
-        y2 = g_y1 + token_inputs_2
-        return tf.concat([y1, y2], axis=-1)
-    
-    def backward_grads(self, y, dy, training=True):
-        dy1, dy2 = dy
-        y1, y2 = y
-
-        with tf.GradientTape() as gtape:
-            gtape.watch(y1)
-            gy1 = self.g(y1, training=training)
-        grads_combined = gtape.gradient(gy1, [y1] + self.g.trainable_variables,
-                                        output_gradients=dy2)
-        dg = grads_combined[1:]
-        dx1 = dy1 + grads_combined[0]
-        x2 = y2 - gy1
-
-        with tf.GradientTape() as ftape:
-            ftape.watch(x2)
-            fx2 = self.f(x2, training=training)
-        grads_combined = ftape.gradient(fx2, [x2] + self.f.trainable_variables,
-                                        output_gradients=dx1)
-        df = grads_combined[1:]
-        dx2 = dy2 + grads_combined[0]
-        x1 = y1 - fx2
-
-        x = x1, x2
-        dx = dx1, dx2
-        grads = df + dg
-
-        return x, dx, grads
-    
-    def get_config(self):
-        return {"ff_units": self.ff_units,
-                "d_model": self.d_model,
-                "num_heads": self.num_heads,
-                "dropout": self.dropout,
-                "causal": self.causal,
-                "efficient_attention": self.efficient_attention,
-                "shared_qk": self.shared_qk,
-                "conv_padding": self.conv_padding,
-                "conv_filter": self.conv_filter,
-                "activation": self.activation}
-
     
 class TransformerStack(tf.keras.models.Model):
-    """
-    Build a stack of Transformer layers as Encoder/Decoder
-    """
-    def __init__(self, layers, ff_units, d_model, num_heads, dropout, causal=False, conv_filter=1, conv_padding="same",
-                 efficient_attention=False, shared_qk=False, activation="relu", weight_sharing=False, reversible=False,
-                 fused_qkv=False, name="TransformerStack"):
+    def __init__(self, transformer_config, name="TransformerStack"):
         """
-        Initialize Transformer layer stack
-        Args:
-            layers: (int) Number of transformer layers in the stack
-            d_model: (int) Dimension of hidden layers. Must be a multiple of `num_heads`
-            ff_units: (int) Dimension of hidden layer in positional feed-forward unit
-            num_heads: (int) Number of attention heads
-            dropout: (float) dropout rate after MHA and feed-forward net
-            causal: (int) Disallow MHA "looking into the future" by masking future time steps
-            layer_norm: (string) Configuration of layer normalization. Defaults to "single" (GPT-2-like) or "double" (GPT-like)
-            activation: (string) Activation function to use inside feed-forward net. Defaults to "relu"
-            weight_sharing: (bool) Share weights between all Transformer layers. Defaults to False
+        Build a stack of Transformer layers as Encoder or Decoder
         Inputs:
             inputs: (dict) Dictionary with keys "token_inputs" and "mask_inputs"
         Outputs:
-            N-D tensor with shape: `(batch_size, ..., d_model)`
+            N-D tensor with shape: `(batch_size, ..., model_dim)`
         """
         super(TransformerStack, self).__init__(name=name)
-        self.tlayers = layers
-        self.ff_units = ff_units
-        self.d_model = d_model
-        self.dropout = dropout
-        self.num_heads = num_heads
-        self.causal = causal
-        self.efficient_attention = efficient_attention
-        self.shared_qk = shared_qk
-        self.activation = activation
-        self.weight_sharing = weight_sharing
-        self.conv_filter = conv_filter
-        self.conv_padding = conv_padding
-        self.reversible = reversible
-        self.fused_qkv = fused_qkv
-        
-        if self.reversible:
-            TLayer = RevTransformerLayer
-        else:
-            TLayer = TransformerLayer
+        self.tconfig = transformer_config
+        self.tlayers = self.tconfig.layers
+        self.weight_sharing = self.tconfig.weight_sharing
         
         if self.weight_sharing:
             # create one layer and re-use
-            self.xfmer_layer = TLayer(ff_units=self.ff_units,
-                                      d_model=self.d_model,
-                                      num_heads=self.num_heads,
-                                      dropout=self.dropout,
-                                      causal=self.causal,
-                                      efficient_attention=self.efficient_attention,
-                                      shared_qk=self.shared_qk,
-                                      activation=self.activation,
-                                      conv_filter=self.conv_filter,
-                                      conv_padding=self.conv_padding,
-                                      fused_qkv=self.fused_qkv,
-                                      name=self.name+"_Layer")
+            self.xfmer_layer = TransformerLayer(self.tconfig, name=self.name+"_Layer")
             self.xfmer_layers = [self.xfmer_layer for i in range(self.tlayers)]
         else:
             # create a list of layers
             self.xfmer_layers = [
-                TLayer(ff_units=self.ff_units,
-                       d_model=self.d_model,
-                       num_heads=self.num_heads,
-                       dropout=self.dropout,
-                       causal=self.causal,
-                       efficient_attention=self.efficient_attention,
-                       shared_qk=self.shared_qk,
-                       activation=self.activation,
-                       conv_filter=self.conv_filter,
-                       conv_padding=self.conv_padding,
-                       fused_qkv=self.fused_qkv,
-                       name=self.name+"_Layer_"+str(i+1)) for i in range(self.tlayers)
+                TransformerLayer(self.tconfig,
+                                 name=self.name+"_Layer_"+str(i+1)) for i in range(self.tlayers)
             ]
     
     def call(self, inputs):
@@ -446,16 +218,7 @@ class TransformerStack(tf.keras.models.Model):
         return outputs
     
     def get_config(self):
-        return {"layers": self.layers,
-                "ff_units": self.ff_units,
-                "d_model": self.d_model,
-                "num_heads": self.num_heads,
-                "dropout": self.dropout,
-                "causal": self.causal,
-                "activation": self.activation,
-                "efficient_attention": self.efficient_attention,
-                "shared_qk": self.shared_qk,
-                "fused_qkv": self.fused_qkv,
+        return {"tlayers": self.tlayers,
                 "weight_sharing": self.weight_sharing}
     
 
@@ -463,53 +226,52 @@ class TokenPosEmbedding(tf.keras.layers.Layer):
     """
     Transformer Token and Position Embedding layer
     """
-    def __init__(self, d_vocab, d_model, pos_length=512, scale=1, d_projection=None, name="TokenPosEmbedding"):
+    def __init__(self, transformer_config, name="TokenPosEmbedding"):
         """
         Initialize Transformer Embedding layer for token and position embeddings.
         This must be the very first layer in any model after the Input layer.
-        Args:
-            d_vocab: (int) Input vocabulary size
-            d_model: (int) Dimension of embeddings
-            pos_length: (int) Maximum length of position embeddings
-            scale: (int) Apply scaling of int to token embeddings. Defaults to 1
-            d_projection: (int) Factorized embedding parameterization (ALBERT-like). Projects output to another dimension
         Inputs:
-            token_inputs: 1D Tensor of integer numbers (< d_vocab) and of maximum length pos_length
+            token_inputs: 1D Tensor of integer numbers (< vocab_size) and of maximum length max_seq_len
         Outputs:
-            N-D tensor with shape: `(batch_size, ..., d_model)`
+            N-D tensor with shape: `(batch_size, ..., model_dim)`
         """
         super(TokenPosEmbedding, self).__init__(name=name)
-        self.d_vocab = d_vocab
-        self.d_model = d_model
-        self.pos_length = pos_length
-        self.scale = scale
-        self.d_projection = d_projection
+        self.tconfig = transformer_config
+        self.vocab_size = self.tconfig.vocab_size
+        self.model_dim = self.tconfig.model_dim
+        self.max_seq_len = self.tconfig.max_seq_len
+        self.embedding_token_scale = self.tconfig.embedding_token_scale
+        self.embedding_projection = self.tconfig.embedding_projection
+        self.initializer_range = self.tconfig.initializer_range
+        self.weight_decay = self.tconfig.weight_decay
+        self.epsilon = self.tconfig.epsilon
         
-        self.token_embeddings = tf.keras.layers.Embedding(self.d_vocab,
-                                                          self.d_model,
-                                                          embeddings_initializer=ops.get_initializer(0.02),
+        self.token_embeddings = tf.keras.layers.Embedding(self.vocab_size,
+                                                          self.model_dim,
+                                                          embeddings_initializer=ops.get_initializer(self.initializer_range),
                                                           name="token_embedding",)
-        self.pos_embeddings = tf.keras.layers.Embedding(self.pos_length,
-                                                        self.d_model,
-                                                        embeddings_initializer=ops.get_initializer(0.02),
+        self.pos_embeddings = tf.keras.layers.Embedding(self.max_seq_len,
+                                                        self.model_dim,
+                                                        embeddings_initializer=ops.get_initializer(self.initializer_range),
                                                         name="token_embedding",)
-        if self.d_projection:
-            self.projection = tf.keras.layers.Dense(units=self.d_projection,
-                                                    kernel_initializer=ops.get_initializer(0.02),
-                                                    kernel_regularizer=tf.keras.regularizers.l2(0.00001))
+        if self.embedding_projection:
+            self.projection = tf.keras.layers.Dense(units=self.embedding_projection,
+                                                    kernel_initializer=ops.get_initializer(self.initializer_range),
+                                                    kernel_regularizer=tf.keras.regularizers.l2(self.tconfig.weight_decay))
             
-        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layer_norm = tf.keras.layers.LayerNormalization(epsilon=self.epsilon)
 
     def call(self, inputs):
         pos_range = ops.position_range(tf.shape(inputs)[-1])
 
         self.token_vector = self.token_embeddings(inputs)
-        self.token_vector *= self.scale
+        if self.embedding_token_scale != 1:
+            self.token_vector *= self.embedding_token_scale
         self.pos_vector = self.pos_embeddings(pos_range)
 
         embeddings = self.token_vector + self.pos_vector
         
-        if self.d_projection:
+        if self.embedding_projection:
             embeddings = self.projection(embeddings)
             
         embeddings = self.layer_norm(embeddings)
@@ -517,22 +279,20 @@ class TokenPosEmbedding(tf.keras.layers.Layer):
         return embeddings
     
     def get_config(self):
-        return {"d_vocab": self.d_vocab,
-                "d_model": self.d_model,
-                "pos_length": self.pos_length,
-                "d_projection": self.d_projection,
-                "scale": self.scale}
+        return {"vocab_size": self.vocab_size,
+                "model_dim": self.model_dim,
+                "max_seq_len": self.max_seq_len,
+                "embedding_token_scale": self.embedding_token_scale,
+                "embedding_projection": self.embedding_projection,
+                "initializer_range": self.initializer_range,
+                "weight_decay": self.weight_decay,
+                "epsilon": self.epsilon}
 
-
+    
 class PaddingMaskGenerator(tf.keras.layers.Layer):
-    """
-    Generate padding mask for sequence
-    """
     def __init__(self, name="PaddingMaskGenerator"):
         """
         Creates a mask for any padding (`0`) characters in the input sequence
-        Args:
-            None
         Inputs:
             token_inputs: 1D Tensor of integer numbers
         Outputs:
@@ -610,7 +370,7 @@ class LSHAttention(tf.keras.Model):
             buckets = tf.reshape(buckets + offsets, (batch_size, -1,))
         else:
             rotated_vecs = tf.concat([rotated_vecs, -rotated_vecs], axis=-1)
-            # In this configuration, we map each item to the top self.n_hashes buckets
+            # In this transformer_configuration, we map each item to the top self.n_hashes buckets
             rotated_vecs = tf.squeeze(rotated_vecs, axis=0)
             bucket_range = tf.range(rotated_vecs.shape[-1])
             bucket_range = tf.reshape(bucket_range, (1, -1))

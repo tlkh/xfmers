@@ -1,10 +1,11 @@
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("--fused_qkv", action="store_true", default=False)
+parser.add_argument("--fused_qkv", action="store_true", default=True)
 parser.add_argument("--weight_sharing", action="store_true", default=False)
 parser.add_argument("--layers", default=12, type=int)
 parser.add_argument("--heads", default=12, type=int)
 parser.add_argument("--steps", type=int)
+parser.add_argument("--num_chars", type=int)
 parser.add_argument("--outdir", default="./", type=str)
 args = parser.parse_args()
 
@@ -37,26 +38,13 @@ tf.config.threading.set_inter_op_parallelism_threads(n_cores)
 from xfmers import models
 from xfmers import utils
 from xfmers import ops
+from xfmers import config
 
-MAX_SEQ_LEN = 128
+MAX_SEQ_LEN = 80
 BATCH_SIZE = 80
 EPOCHS = 20
 BUFFER_SIZE = 10000000
-
-NUM_LAYERS = args.layers
 NUM_HEADS = args.heads
-D_MODEL = NUM_HEADS * 64
-FF_UNITS = D_MODEL * 4
-DROPOUT = 0.1
-WEIGHT_SHARING = args.weight_sharing
-EFFICIENT_ATTENTION = False
-SHARED_QK = False
-CONV_FILTER = 1
-CONV_PADDING = "same"
-ACTIVATION = ops.gelu
-REVERSIBLE = False
-FUSED_QKV = args.fused_qkv
-CAUSAL = True
 
 strategy = tf.distribute.MirroredStrategy()
 print("Number of devices: {}".format(strategy.num_replicas_in_sync))
@@ -71,22 +59,35 @@ def load_text8(text8_path, num_char=None):
         data = data[:num_char]
     return data.strip()
 
-text_8_train = load_text8("./data/train.txt.raw")
+text_8_train = load_text8("./data/train.txt.raw", args.num_chars)
 
 if os.path.isfile("./subwords/text8vocab.subwords"):
     tokenizer = tfds.features.text.SubwordTextEncoder.load_from_file("./subwords/text8vocab")
 else:
-    text_all = text_8_train + load_text8("./data/valid.txt.raw")
-    tokenizer = tfds.features.text.SubwordTextEncoder.build_from_corpus([text_all],
-                                                                        target_vocab_size=20480)
+    tokenizer = tfds.features.text.SubwordTextEncoder.build_from_corpus([text_8_train],
+                                                                        target_vocab_size=5120)
     tokenizer.save_to_file("./subwords/text8vocab")
-    del text_all
 if tokenizer.vocab_size%8 == 0:
     VOCAB_SIZE = tokenizer.vocab_size
 else:
     VOCAB_SIZE = tokenizer.vocab_size
     mult_8 = VOCAB_SIZE//8
     VOCAB_SIZE = (mult_8 + 1) * 8
+    
+model_config = config.TransformerConfig(num_heads=NUM_HEADS,
+                                        model_dim=NUM_HEADS*64,
+                                        layers=args.layers,
+                                        ffn_dim=4*NUM_HEADS*64,
+                                        causal=True,
+                                        vocab_size=VOCAB_SIZE,
+                                        shared_qk=False,
+                                        fused_qkv=args.fused_qkv,
+                                        weight_sharing=args.weight_sharing,
+                                        max_seq_len=MAX_SEQ_LEN,
+                                        weight_decay=0.001,
+                                        dropout=0.1)
+
+model_config.summary()
 
 """
 char_set = list(set(list(text_8_train)))
@@ -128,7 +129,7 @@ list_seq = prepare_sequences(text_8_train, tokenizer, interval=interval, seq_len
 
 print("Training sequences:", list_seq.shape)
 
-text_8_val = load_text8("./data/valid.txt.raw")
+text_8_val = load_text8("./data/valid.txt.raw", args.num_chars)
 
 list_seq_val = prepare_sequences(text_8_val, tokenizer, interval=interval, seq_len=MAX_SEQ_LEN)
 
@@ -180,29 +181,14 @@ del text_8_train
 del text_8_val
 
 with strategy.scope():
-    model = models.Transformer(
-        vocab_size=VOCAB_SIZE,
-        dec_layers=NUM_LAYERS,
-        ff_units=FF_UNITS,
-        d_model=D_MODEL,
-        num_heads=NUM_HEADS,
-        dropout=DROPOUT,
-        max_seq_len=MAX_SEQ_LEN,
-        weight_sharing=WEIGHT_SHARING,
-        efficient_attention=EFFICIENT_ATTENTION,
-        shared_qk=SHARED_QK,
-        activation=ACTIVATION,
-        reversible=REVERSIBLE,
-        fused_qkv=FUSED_QKV,
-        causal=CAUSAL
-    )
+    model = models.Transformer(model_config)
     learning_rate = utils.WarmupExpDecay(
         epoch_steps=train_steps,
-        base_lr=8e-5,
+        base_lr=1e-5,
         min_lr=1e-8,
         decay_exp=10,
         warmup_epochs=1,
-        flat_epochs=1+EPOCHS//2,
+        flat_epochs=EPOCHS-3,
         max_epochs=EPOCHS,
     )
     plt.plot(learning_rate(tf.range(train_steps*(EPOCHS-1), dtype=tf.float32)))
